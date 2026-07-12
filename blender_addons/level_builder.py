@@ -94,6 +94,7 @@ def build_group(context, group):
         add_duplicates = [normalized_duplicate(obj) for obj in additive_objs]
 
         base_dup, *remaining_sub = sub_duplicates
+        mesh_name = group.output_name.strip() or f"{root.name}_LevelMesh"
 
         temp_obj = bpy.data.objects.new("LEVELBUILDER_TEMP", base_dup.data)
         temp_obj.location = (0.0, 0.0, 0.0)
@@ -120,7 +121,7 @@ def build_group(context, group):
         depsgraph = context.evaluated_depsgraph_get()
         eval_obj = temp_obj.evaluated_get(depsgraph)
         built_mesh = bpy.data.meshes.new_from_object(eval_obj)
-        built_mesh.name = f"{root.name}_LevelMesh"
+        built_mesh.name = mesh_name
 
         bm = bmesh.new()
         bm.from_mesh(built_mesh)
@@ -135,14 +136,14 @@ def build_group(context, group):
         output_obj = group.output_object
         if output_obj is None or output_obj.name not in bpy.data.objects:
             out_coll = get_output_collection(context)
-            output_obj = bpy.data.objects.new(f"{root.name}_LevelMesh", built_mesh)
+            output_obj = bpy.data.objects.new(mesh_name, built_mesh)
             output_obj.location = (0.0, 0.0, 0.0)
             out_coll.objects.link(output_obj)
             group.output_object = output_obj
         else:
             old_mesh = output_obj.data
             output_obj.data = built_mesh
-            output_obj.name = f"{root.name}_LevelMesh"
+            output_obj.name = mesh_name
             if old_mesh is not None and old_mesh.users == 0:
                 bpy.data.meshes.remove(old_mesh)
 
@@ -159,6 +160,11 @@ def build_group(context, group):
 class LevelBuilderGroup(bpy.types.PropertyGroup):
     root_collection: PointerProperty(name="Builder Collection", type=bpy.types.Collection)
     output_object: PointerProperty(name="Output Object", type=bpy.types.Object)
+    output_name: StringProperty(
+        name="Output Name",
+        description="Name for the built level mesh object/data; defaults to '<Collection>_LevelMesh' if left blank",
+        default="",
+    )
     solver: EnumProperty(
         name="Solver",
         items=[
@@ -354,6 +360,7 @@ class LEVELBUILDER_PT_panel(bpy.types.Panel):
             row.operator("levelbuilder.move_selected", text="→ Subtractive").target = 'SUBTRACTIVE'
             row.operator("levelbuilder.move_selected", text="→ Additive").target = 'ADDITIVE'
 
+            box.prop(group, "output_name", placeholder=f"{group.root_collection.name}_LevelMesh" if group.root_collection else "")
             box.prop(group, "solver")
             box.prop(group, "weld_distance")
             box.prop(group, "recalc_normals")
