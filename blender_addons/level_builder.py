@@ -39,6 +39,34 @@ def collect_mesh_objects(collection):
     return result
 
 
+def build_master_material_list(objs):
+    materials = []
+    for obj in objs:
+        for slot in obj.material_slots:
+            mat = slot.material
+            if mat is not None and mat not in materials:
+                materials.append(mat)
+    return materials
+
+
+def remap_object_materials(obj, master_list):
+    old_effective = [slot.material for slot in obj.material_slots]
+
+    mesh = obj.data
+    old_face_indices = [poly.material_index for poly in mesh.polygons]
+
+    mesh.materials.clear()
+    for mat in master_list:
+        mesh.materials.append(mat)
+
+    remap = {}
+    for old_index, mat in enumerate(old_effective):
+        remap[old_index] = master_list.index(mat) if mat is not None and mat in master_list else 0
+
+    for poly, old_index in zip(mesh.polygons, old_face_indices):
+        poly.material_index = remap.get(old_index, 0)
+
+
 def get_output_collection(context):
     coll = bpy.data.collections.get(OUTPUT_COLLECTION_NAME)
     if coll is None:
@@ -68,6 +96,7 @@ def build_group(context, group):
         raise LevelBuildError(f"'{root.name}/{SUBTRACTIVE_NAME}' has no mesh objects")
 
     additive_objs = collect_mesh_objects(add_coll) if add_coll else []
+    master_materials = build_master_material_list(subtractive_objs + additive_objs)
 
     scene = context.scene
     cleanup_objs = []
@@ -87,6 +116,7 @@ def build_group(context, group):
         scene.collection.objects.link(dup_obj)
         cleanup_objs.append(dup_obj)
         recalc_outside(dup_obj.data)
+        remap_object_materials(dup_obj, master_materials)
         return dup_obj
 
     try:
@@ -123,6 +153,20 @@ def build_group(context, group):
         built_mesh = bpy.data.meshes.new_from_object(eval_obj)
         built_mesh.name = mesh_name
 
+        old_built_materials = list(built_mesh.materials)
+        old_built_indices = [poly.material_index for poly in built_mesh.polygons]
+
+        built_mesh.materials.clear()
+        for mat in master_materials:
+            built_mesh.materials.append(mat)
+
+        built_remap = {}
+        for old_index, mat in enumerate(old_built_materials):
+            built_remap[old_index] = master_materials.index(mat) if mat is not None and mat in master_materials else 0
+
+        for poly, old_index in zip(built_mesh.polygons, old_built_indices):
+            poly.material_index = built_remap.get(old_index, 0)
+
         bm = bmesh.new()
         bm.from_mesh(built_mesh)
         bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=group.weld_distance)
@@ -132,6 +176,18 @@ def build_group(context, group):
         bm.to_mesh(built_mesh)
         bm.free()
         built_mesh.update()
+
+        if group.trim_unused_materials and built_mesh.materials:
+            old_trim_indices = [poly.material_index for poly in built_mesh.polygons]
+            used_indices = sorted(set(old_trim_indices))
+            if len(used_indices) < len(built_mesh.materials):
+                trimmed = [built_mesh.materials[i] for i in used_indices]
+                trim_remap = {old: new for new, old in enumerate(used_indices)}
+                built_mesh.materials.clear()
+                for mat in trimmed:
+                    built_mesh.materials.append(mat)
+                for poly, old_index in zip(built_mesh.polygons, old_trim_indices):
+                    poly.material_index = trim_remap[old_index]
 
         output_obj = group.output_object
         if output_obj is None or output_obj.name not in bpy.data.objects:
@@ -184,6 +240,11 @@ class LevelBuilderGroup(bpy.types.PropertyGroup):
     recalc_normals: BoolProperty(
         name="Recalculate Normals",
         description="Normalize then flip all normals so the result faces inward",
+        default=True,
+    )
+    trim_unused_materials: BoolProperty(
+        name="Trim Unused Materials",
+        description="Remove material slots not used by any face after building",
         default=True,
     )
 
@@ -364,6 +425,7 @@ class LEVELBUILDER_PT_panel(bpy.types.Panel):
             box.prop(group, "solver")
             box.prop(group, "weld_distance")
             box.prop(group, "recalc_normals")
+            box.prop(group, "trim_unused_materials")
 
             if group.output_object:
                 box.label(text=f"Output: {group.output_object.name}", icon='MESH_DATA')
