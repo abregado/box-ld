@@ -67,6 +67,24 @@ def remap_object_materials(obj, master_list):
         poly.material_index = remap.get(old_index, 0)
 
 
+def set_object_origin_to_world_point(obj, world_point):
+    """Move obj's origin to world_point without moving its geometry.
+
+    Assumes obj currently has an identity transform (location (0,0,0),
+    no rotation, scale 1) so its mesh-local coordinates equal world
+    coordinates - the caller is responsible for that precondition.
+    """
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    for v in bm.verts:
+        v.co -= world_point
+    bm.to_mesh(obj.data)
+    bm.free()
+    obj.data.update()
+
+    obj.location = world_point
+
+
 def get_output_collection(context):
     coll = bpy.data.collections.get(OUTPUT_COLLECTION_NAME)
     if coll is None:
@@ -193,7 +211,6 @@ def build_group(context, group):
         if output_obj is None or output_obj.name not in bpy.data.objects:
             out_coll = get_output_collection(context)
             output_obj = bpy.data.objects.new(mesh_name, built_mesh)
-            output_obj.location = (0.0, 0.0, 0.0)
             out_coll.objects.link(output_obj)
             group.output_object = output_obj
         else:
@@ -202,6 +219,13 @@ def build_group(context, group):
             output_obj.name = mesh_name
             if old_mesh is not None and old_mesh.users == 0:
                 bpy.data.meshes.remove(old_mesh)
+
+        output_obj.location = (0.0, 0.0, 0.0)
+        output_obj.rotation_euler = (0.0, 0.0, 0.0)
+        output_obj.scale = (1.0, 1.0, 1.0)
+
+        if group.origin_object is not None:
+            set_object_origin_to_world_point(output_obj, group.origin_object.matrix_world.translation.copy())
 
     finally:
         for obj in cleanup_objs:
@@ -220,6 +244,11 @@ class LevelBuilderGroup(bpy.types.PropertyGroup):
         name="Output Name",
         description="Name for the built level mesh object/data; defaults to '<Collection>_LevelMesh' if left blank",
         default="",
+    )
+    origin_object: PointerProperty(
+        name="Origin Object",
+        type=bpy.types.Object,
+        description="After building, the output mesh's origin is moved to this object's world position, without moving the mesh itself",
     )
     solver: EnumProperty(
         name="Solver",
@@ -422,6 +451,7 @@ class LEVELBUILDER_PT_panel(bpy.types.Panel):
             row.operator("levelbuilder.move_selected", text="→ Additive").target = 'ADDITIVE'
 
             box.prop(group, "output_name", placeholder=f"{group.root_collection.name}_LevelMesh" if group.root_collection else "")
+            box.prop(group, "origin_object")
             box.prop(group, "solver")
             box.prop(group, "weld_distance")
             box.prop(group, "recalc_normals")
