@@ -8,6 +8,8 @@ bl_info = {
     "category": "Object",
 }
 
+import re
+
 import bpy
 import bmesh
 from bpy.props import (
@@ -27,6 +29,14 @@ OUTPUT_COLLECTION_NAME = "Level Output"
 
 class LevelBuildError(Exception):
     pass
+
+
+def find_child_collection(root, base_name):
+    pattern = re.compile(rf"^{re.escape(base_name)}(\.\d+)?$")
+    for child in root.children:
+        if pattern.match(child.name):
+            return child
+    return None
 
 
 def collect_mesh_objects(collection):
@@ -103,8 +113,8 @@ def build_group(context, group):
     if root is None:
         raise LevelBuildError("No builder collection set")
 
-    sub_coll = root.children.get(SUBTRACTIVE_NAME)
-    add_coll = root.children.get(ADDITIVE_NAME)
+    sub_coll = find_child_collection(root, SUBTRACTIVE_NAME)
+    add_coll = find_child_collection(root, ADDITIVE_NAME)
 
     if sub_coll is None:
         raise LevelBuildError(f"'{root.name}' is missing a '{SUBTRACTIVE_NAME}' sub-collection")
@@ -346,7 +356,7 @@ class LEVELBUILDER_OT_move_selected(bpy.types.Operator):
             self.report({'ERROR'}, "Builder group has no collection")
             return {'CANCELLED'}
 
-        target_coll = root.children.get(SUBTRACTIVE_NAME if self.target == 'SUBTRACTIVE' else ADDITIVE_NAME)
+        target_coll = find_child_collection(root, SUBTRACTIVE_NAME if self.target == 'SUBTRACTIVE' else ADDITIVE_NAME)
         if target_coll is None:
             self.report({'ERROR'}, "Builder group is missing its Subtractive/Additive sub-collection")
             return {'CANCELLED'}
