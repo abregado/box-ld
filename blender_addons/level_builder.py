@@ -95,6 +95,69 @@ def set_object_origin_to_world_point(obj, world_point):
     obj.location = world_point
 
 
+def quantize_mesh_in_world_space(obj, snap_distance):
+    """Round obj's vertex coordinates to a world-space grid.
+
+    Removes float drift (e.g. from duplication/transforms) between verts on
+    different objects that are meant to coincide exactly, which otherwise
+    can make coplanar faces fail to register as touching for booleans.
+    """
+    if snap_distance <= 0.0:
+        return
+
+    matrix = obj.matrix_world
+    inv_matrix = matrix.inverted()
+
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    bm.transform(matrix)
+    for v in bm.verts:
+        v.co.x = round(v.co.x / snap_distance) * snap_distance
+        v.co.y = round(v.co.y / snap_distance) * snap_distance
+        v.co.z = round(v.co.z / snap_distance) * snap_distance
+    bm.transform(inv_matrix)
+    bm.to_mesh(obj.data)
+    bm.free()
+    obj.data.update()
+
+
+def inflate_mesh_in_world_space(obj, epsilon):
+    """Push obj's verts outward from its bounding-box center by a fixed
+    world-space margin per axis.
+
+    Makes flush/coplanar faces between adjacent boolean operands actually
+    overlap in volume instead of exactly touching, which is the case
+    Blender's boolean solvers handle least reliably.
+    """
+    if epsilon <= 0.0:
+        return
+
+    matrix = obj.matrix_world
+    inv_matrix = matrix.inverted()
+
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    bm.transform(matrix)
+
+    if bm.verts:
+        center = [
+            (min(v.co[axis] for v in bm.verts) + max(v.co[axis] for v in bm.verts)) / 2.0
+            for axis in range(3)
+        ]
+        for v in bm.verts:
+            for axis in range(3):
+                delta = v.co[axis] - center[axis]
+                if delta > 0.0:
+                    v.co[axis] += epsilon
+                elif delta < 0.0:
+                    v.co[axis] -= epsilon
+
+    bm.transform(inv_matrix)
+    bm.to_mesh(obj.data)
+    bm.free()
+    obj.data.update()
+
+
 def get_output_collection(context):
     coll = bpy.data.collections.get(OUTPUT_COLLECTION_NAME)
     if coll is None:
@@ -144,6 +207,8 @@ def build_group(context, group):
         scene.collection.objects.link(dup_obj)
         cleanup_objs.append(dup_obj)
         recalc_outside(dup_obj.data)
+        quantize_mesh_in_world_space(dup_obj, group.snap_distance)
+        inflate_mesh_in_world_space(dup_obj, group.overlap_epsilon)
         remap_object_materials(dup_obj, master_materials)
         return dup_obj
 
@@ -267,6 +332,31 @@ class LevelBuilderGroup(bpy.types.PropertyGroup):
             ('FAST', "Fast", "Faster boolean solver, less robust on complex overlaps"),
         ],
         default='EXACT',
+    )
+    snap_distance: FloatProperty(
+        name="Snap Distance",
+        description=(
+            "World-space grid size each operand's vertices are rounded to before "
+            "booleaning. Removes float drift between verts on different objects "
+            "that are meant to coincide exactly. Set to 0 to disable"
+        ),
+        default=0.0001,
+        min=0.0,
+        precision=6,
+        unit='LENGTH',
+    )
+    overlap_epsilon: FloatProperty(
+        name="Overlap Epsilon",
+        description=(
+            "Grow each operand outward by this amount (per axis, from its own "
+            "bounding-box center) before booleaning, so flush/coplanar faces "
+            "between adjacent pieces overlap instead of exactly touching. "
+            "Set to 0 to disable"
+        ),
+        default=0.0005,
+        min=0.0,
+        precision=5,
+        unit='LENGTH',
     )
     weld_distance: FloatProperty(
         name="Weld Distance",
@@ -463,6 +553,8 @@ class LEVELBUILDER_PT_panel(bpy.types.Panel):
             box.prop(group, "output_name", placeholder=f"{group.root_collection.name}_LevelMesh" if group.root_collection else "")
             box.prop(group, "origin_object")
             box.prop(group, "solver")
+            box.prop(group, "snap_distance")
+            box.prop(group, "overlap_epsilon")
             box.prop(group, "weld_distance")
             box.prop(group, "recalc_normals")
             box.prop(group, "trim_unused_materials")
