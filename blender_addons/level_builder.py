@@ -8,7 +8,15 @@ bl_info = {
     "category": "Object",
 }
 
+import importlib
+import importlib.util
 import re
+import subprocess
+import sys
+import time
+from typing import NamedTuple
+
+import numpy as np
 
 import bpy
 import bmesh
@@ -29,6 +37,11 @@ OUTPUT_COLLECTION_NAME = "Level Output"
 
 class LevelBuildError(Exception):
     pass
+
+
+class BuildInfo(NamedTuple):
+    face_count: int
+    portal_note: str
 
 
 def find_child_collection(root, base_name):
@@ -158,6 +171,146 @@ def inflate_mesh_in_world_space(obj, epsilon):
     obj.data.update()
 
 
+def manifold_available():
+    return importlib.util.find_spec("manifold3d") is not None
+
+
+def describe_open_edges(mesh):
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    open_edges = sum(1 for e in bm.edges if len(e.link_faces) < 2)
+    multi_edges = sum(1 for e in bm.edges if len(e.link_faces) > 2)
+    bm.free()
+    parts = []
+    if open_edges:
+        parts.append(f"{open_edges} open edge(s)")
+    if multi_edges:
+        parts.append(f"{multi_edges} edge(s) shared by 3+ faces")
+    return ", ".join(parts)
+
+
+def object_to_manifold(mf, obj, face_id_start):
+    """Convert obj (in world space) to a manifold3d Manifold.
+
+    Every input triangle gets a unique face ID (face_id_start + triangle
+    index), which manifold3d carries through booleans so the caller can map
+    result triangles back to a material. Returns (manifold, tri_materials).
+    """
+    mesh = obj.data
+    mesh.calc_loop_triangles()
+    tri_count = len(mesh.loop_triangles)
+    if tri_count == 0:
+        raise LevelBuildError(f"'{obj.name}' has no faces")
+
+    co = np.empty(len(mesh.vertices) * 3, dtype=np.float32)
+    mesh.vertices.foreach_get("co", co)
+    matrix = np.array(obj.matrix_world, dtype=np.float64)
+    world_co = co.reshape(-1, 3).astype(np.float64) @ matrix[:3, :3].T + matrix[:3, 3]
+
+    tris = np.empty(tri_count * 3, dtype=np.int32)
+    mesh.loop_triangles.foreach_get("vertices", tris)
+    tris = tris.reshape(-1, 3)
+    if np.linalg.det(matrix[:3, :3]) < 0.0:
+        tris = tris[:, ::-1]
+
+    tri_poly = np.empty(tri_count, dtype=np.int32)
+    mesh.loop_triangles.foreach_get("polygon_index", tri_poly)
+    poly_mat = np.empty(len(mesh.polygons), dtype=np.int32)
+    mesh.polygons.foreach_get("material_index", poly_mat)
+    tri_materials = poly_mat[tri_poly]
+
+    mf_mesh = mf.Mesh(
+        vert_properties=np.ascontiguousarray(world_co, dtype=np.float32),
+        tri_verts=np.ascontiguousarray(tris, dtype=np.uint32),
+        face_id=np.arange(face_id_start, face_id_start + tri_count, dtype=np.uint32),
+    )
+    mf_mesh.merge()
+    manifold = mf.Manifold(mf_mesh)
+
+    if manifold.status() != mf.Error.NoError or manifold.is_empty():
+        detail = describe_open_edges(mesh)
+        raise LevelBuildError(
+            f"'{obj.name}' is not a closed manifold mesh"
+            + (f" ({detail})" if detail else f" ({manifold.status()})")
+            + ". Cap doorway openings with the Doorway Material instead of leaving them open"
+        )
+    if manifold.volume() <= 0.0:
+        raise LevelBuildError(f"'{obj.name}' has no volume (flat or inside-out mesh)")
+
+    return manifold, tri_materials
+
+
+def uses_material_index(obj, material_index):
+    poly_mat = np.empty(len(obj.data.polygons), dtype=np.int32)
+    obj.data.polygons.foreach_get("material_index", poly_mat)
+    return bool((poly_mat == material_index).any())
+
+
+def boolean_with_manifold(subtractive_objs, additive_objs, master_materials, mesh_name, portal_index=-1):
+    """Union the subtractive objects, subtract the additive ones, and return
+    a new triangle mesh using master_materials. Objects must have material
+    indices already remapped to master_materials.
+
+    Where two objects have coplanar overlapping faces only one survives, and
+    manifold3d keeps the one from the object converted first. Objects with
+    doorway faces (portal_index) are converted first so the doorway face
+    always wins over a wall face it overlaps and can then be removed."""
+    try:
+        import manifold3d as mf
+    except ImportError as e:
+        raise LevelBuildError(
+            f"Could not import 'manifold3d' ({e}) - use the 'Install manifold3d' button in the Level Builder panel"
+        )
+
+    tri_materials = []
+    face_id_start = 0
+
+    def convert(objs):
+        nonlocal face_id_start
+        manifolds = []
+        if portal_index >= 0:
+            objs = sorted(objs, key=lambda o: not uses_material_index(o, portal_index))
+        for obj in objs:
+            manifold, obj_tri_materials = object_to_manifold(mf, obj, face_id_start)
+            face_id_start += len(obj_tri_materials)
+            tri_materials.append(obj_tri_materials)
+            manifolds.append(manifold)
+        return manifolds
+
+    def union(manifolds):
+        return manifolds[0] if len(manifolds) == 1 else mf.Manifold.batch_boolean(manifolds, mf.OpType.Add)
+
+    sub_manifolds = convert(subtractive_objs)
+    add_manifolds = convert(additive_objs)
+
+    result = union(sub_manifolds)
+    if add_manifolds:
+        result = result - union(add_manifolds)
+    if result.is_empty():
+        raise LevelBuildError("Manifold boolean produced an empty mesh")
+
+    out = result.to_mesh()
+    verts = np.asarray(out.vert_properties)[:, :3]
+    tris = np.asarray(out.tri_verts)
+    result_materials = np.concatenate(tri_materials)[np.asarray(out.face_id, dtype=np.int64)]
+
+    built_mesh = bpy.data.meshes.new(mesh_name)
+    bm = bmesh.new()
+    bm_verts = [bm.verts.new(co) for co in verts.tolist()]
+    for tri, mat_index in zip(tris.tolist(), result_materials.tolist()):
+        try:
+            face = bm.faces.new([bm_verts[i] for i in tri])
+        except ValueError:
+            continue
+        face.material_index = mat_index
+    bm.to_mesh(built_mesh)
+    bm.free()
+
+    for mat in master_materials:
+        built_mesh.materials.append(mat)
+    return built_mesh
+
+
 def get_output_collection(context):
     coll = bpy.data.collections.get(OUTPUT_COLLECTION_NAME)
     if coll is None:
@@ -191,6 +344,16 @@ def build_group(context, group):
 
     scene = context.scene
     cleanup_objs = []
+    use_manifold = group.engine == 'MANIFOLD'
+
+    portal_index = -1
+    portal_note = ""
+    if group.portal_material is None:
+        portal_note = "no Doorway Material set"
+    elif group.portal_material not in master_materials:
+        portal_note = f"Doorway Material '{group.portal_material.name}' is not used by any object"
+    else:
+        portal_index = master_materials.index(group.portal_material)
 
     def recalc_outside(mesh):
         bm = bmesh.new()
@@ -208,16 +371,13 @@ def build_group(context, group):
         cleanup_objs.append(dup_obj)
         recalc_outside(dup_obj.data)
         quantize_mesh_in_world_space(dup_obj, group.snap_distance)
-        inflate_mesh_in_world_space(dup_obj, group.overlap_epsilon)
+        if not use_manifold:
+            inflate_mesh_in_world_space(dup_obj, group.overlap_epsilon)
         remap_object_materials(dup_obj, master_materials)
         return dup_obj
 
-    try:
-        sub_duplicates = [normalized_duplicate(obj) for obj in subtractive_objs]
-        add_duplicates = [normalized_duplicate(obj) for obj in additive_objs]
-
+    def boolean_with_blender(sub_duplicates, add_duplicates, mesh_name):
         base_dup, *remaining_sub = sub_duplicates
-        mesh_name = group.output_name.strip() or f"{root.name}_LevelMesh"
 
         temp_obj = bpy.data.objects.new("LEVELBUILDER_TEMP", base_dup.data)
         temp_obj.location = (0.0, 0.0, 0.0)
@@ -243,29 +403,55 @@ def build_group(context, group):
         context.view_layer.update()
         depsgraph = context.evaluated_depsgraph_get()
         eval_obj = temp_obj.evaluated_get(depsgraph)
-        built_mesh = bpy.data.meshes.new_from_object(eval_obj)
-        built_mesh.name = mesh_name
+        mesh = bpy.data.meshes.new_from_object(eval_obj)
+        mesh.name = mesh_name
 
-        old_built_materials = list(built_mesh.materials)
-        old_built_indices = [poly.material_index for poly in built_mesh.polygons]
+        old_built_materials = list(mesh.materials)
+        old_built_indices = [poly.material_index for poly in mesh.polygons]
 
-        built_mesh.materials.clear()
+        mesh.materials.clear()
         for mat in master_materials:
-            built_mesh.materials.append(mat)
+            mesh.materials.append(mat)
 
         built_remap = {}
         for old_index, mat in enumerate(old_built_materials):
             built_remap[old_index] = master_materials.index(mat) if mat is not None and mat in master_materials else 0
 
-        for poly, old_index in zip(built_mesh.polygons, old_built_indices):
+        for poly, old_index in zip(mesh.polygons, old_built_indices):
             poly.material_index = built_remap.get(old_index, 0)
+        return mesh
+
+    try:
+        sub_duplicates = [normalized_duplicate(obj) for obj in subtractive_objs]
+        add_duplicates = [normalized_duplicate(obj) for obj in additive_objs]
+        mesh_name = group.output_name.strip() or f"{root.name}_LevelMesh"
+
+        if use_manifold:
+            built_mesh = boolean_with_manifold(sub_duplicates, add_duplicates, master_materials, mesh_name, portal_index)
+        else:
+            built_mesh = boolean_with_blender(sub_duplicates, add_duplicates, mesh_name)
 
         bm = bmesh.new()
         bm.from_mesh(built_mesh)
         bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=group.weld_distance)
+        if use_manifold:
+            # Manifold returns triangles with consistent outward winding; merge
+            # the coplanar ones back into n-gons (never across materials).
+            bmesh.ops.dissolve_limit(
+                bm, angle_limit=1e-3, verts=bm.verts, edges=bm.edges,
+                use_dissolve_boundaries=False, delimit={'MATERIAL'},
+            )
         if group.recalc_normals:
-            bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+            if not use_manifold:
+                bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
             bmesh.ops.reverse_faces(bm, faces=bm.faces, flip_multires=True)
+
+        # Doorway faces keep operands closed for the boolean, then get removed.
+        if portal_index >= 0:
+            portal_faces = [f for f in bm.faces if f.material_index == portal_index]
+            if portal_faces:
+                bmesh.ops.delete(bm, geom=portal_faces, context='FACES')
+            portal_note = f"{len(portal_faces)} doorway face(s) removed"
         bm.to_mesh(built_mesh)
         bm.free()
         built_mesh.update()
@@ -309,7 +495,7 @@ def build_group(context, group):
             if mesh_data is not None and mesh_data.users == 0:
                 bpy.data.meshes.remove(mesh_data)
 
-    return len(built_mesh.polygons)
+    return BuildInfo(len(built_mesh.polygons), portal_note)
 
 
 class LevelBuilderGroup(bpy.types.PropertyGroup):
@@ -324,6 +510,26 @@ class LevelBuilderGroup(bpy.types.PropertyGroup):
         name="Origin Object",
         type=bpy.types.Object,
         description="After building, the output mesh's origin is moved to this object's world position, without moving the mesh itself",
+    )
+    engine: EnumProperty(
+        name="Engine",
+        items=[
+            ('BLENDER', "Blender", "Blender's built-in Boolean modifier (uses the Solver setting)"),
+            (
+                'MANIFOLD', "Manifold",
+                "manifold3d library: much more robust with flush/coplanar faces. "
+                "Every object must be a closed (watertight) mesh - cap doorway openings with the Doorway Material",
+            ),
+        ],
+        default='BLENDER',
+    )
+    portal_material: PointerProperty(
+        name="Doorway Material",
+        type=bpy.types.Material,
+        description=(
+            "Faces using this material are deleted from the built mesh after the booleans. "
+            "Assign it to the cap faces of doorway openings so every object stays a closed mesh"
+        ),
     )
     solver: EnumProperty(
         name="Solver",
@@ -477,13 +683,49 @@ class LEVELBUILDER_OT_build_active(bpy.types.Operator):
             return {'CANCELLED'}
 
         group = scene.level_builder_groups[idx]
+        start = time.perf_counter()
         try:
-            face_count = build_group(context, group)
+            info = build_group(context, group)
         except LevelBuildError as e:
             self.report({'ERROR'}, str(e))
             return {'CANCELLED'}
 
-        self.report({'INFO'}, f"Built '{group.root_collection.name}' ({face_count} faces)")
+        elapsed = time.perf_counter() - start
+        self.report(
+            {'INFO'},
+            f"Built '{group.root_collection.name}' ({info.face_count} faces, {group.engine.title()} engine, "
+            f"{elapsed:.2f}s; {info.portal_note})",
+        )
+        return {'FINISHED'}
+
+
+class LEVELBUILDER_OT_install_manifold(bpy.types.Operator):
+    bl_idname = "levelbuilder.install_manifold"
+    bl_label = "Install manifold3d"
+    bl_description = "Download the manifold3d package with pip into Blender's user scripts/modules folder (needs internet)"
+
+    def execute(self, context):
+        target = bpy.utils.user_resource('SCRIPTS', path="modules", create=True)
+        python = sys.executable
+        try:
+            subprocess.run([python, "-m", "ensurepip"], capture_output=True)
+            subprocess.run(
+                [python, "-m", "pip", "install", "--upgrade", "--no-deps", "--target", target, "manifold3d"],
+                check=True, capture_output=True, text=True,
+            )
+        except (subprocess.CalledProcessError, OSError) as e:
+            detail = getattr(e, "stderr", None) or str(e)
+            self.report({'ERROR'}, f"Installing manifold3d failed: {detail.strip()[-300:]}")
+            return {'CANCELLED'}
+
+        if target not in sys.path:
+            sys.path.append(target)
+        importlib.invalidate_caches()
+        if not manifold_available():
+            self.report({'ERROR'}, "manifold3d installed but could not be imported - restart Blender and try again")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Installed manifold3d into {target}")
         return {'FINISHED'}
 
 
@@ -499,10 +741,12 @@ class LEVELBUILDER_OT_build_all(bpy.types.Operator):
         for group in scene.level_builder_groups:
             name = group.root_collection.name if group.root_collection else "<unnamed>"
             try:
-                build_group(context, group)
+                info = build_group(context, group)
                 built += 1
             except LevelBuildError as e:
                 errors.append(f"{name}: {e}")
+                continue
+            self.report({'INFO'}, f"'{name}': {info.face_count} faces, {group.engine.title()} engine; {info.portal_note}")
 
         if errors:
             self.report({'ERROR'}, "; ".join(errors))
@@ -552,9 +796,16 @@ class LEVELBUILDER_PT_panel(bpy.types.Panel):
 
             box.prop(group, "output_name", placeholder=f"{group.root_collection.name}_LevelMesh" if group.root_collection else "")
             box.prop(group, "origin_object")
-            box.prop(group, "solver")
+            box.prop(group, "engine")
+            if group.engine == 'MANIFOLD':
+                if not manifold_available():
+                    box.label(text="manifold3d is not installed", icon='ERROR')
+                    box.operator("levelbuilder.install_manifold", icon='IMPORT')
+            else:
+                box.prop(group, "solver")
+                box.prop(group, "overlap_epsilon")
+            box.prop(group, "portal_material")
             box.prop(group, "snap_distance")
-            box.prop(group, "overlap_epsilon")
             box.prop(group, "weld_distance")
             box.prop(group, "recalc_normals")
             box.prop(group, "trim_unused_materials")
@@ -574,6 +825,7 @@ classes = (
     LEVELBUILDER_OT_remove_group,
     LEVELBUILDER_OT_move_selected,
     LEVELBUILDER_OT_build_active,
+    LEVELBUILDER_OT_install_manifold,
     LEVELBUILDER_OT_build_all,
     LEVELBUILDER_UL_groups,
     LEVELBUILDER_PT_panel,
