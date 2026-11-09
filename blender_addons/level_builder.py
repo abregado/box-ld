@@ -363,9 +363,18 @@ def build_group(context, group):
         bm.free()
         mesh.update()
 
+    context.view_layer.update()
+    depsgraph = context.evaluated_depsgraph_get()
+
     def normalized_duplicate(obj):
         dup_obj = obj.copy()
-        dup_obj.data = obj.data.copy()
+        if obj.modifiers:
+            # Bake the modifier stack into the copy's mesh so the original
+            # object keeps its modifiers and the merge sees the final shape.
+            dup_obj.data = bpy.data.meshes.new_from_object(obj.evaluated_get(depsgraph), depsgraph=depsgraph)
+            dup_obj.modifiers.clear()
+        else:
+            dup_obj.data = obj.data.copy()
         dup_obj.name = f"LEVELBUILDER_TEMP_{obj.name}"
         scene.collection.objects.link(dup_obj)
         cleanup_objs.append(dup_obj)
